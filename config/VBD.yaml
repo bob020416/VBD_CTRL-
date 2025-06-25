@@ -1,8 +1,8 @@
 model_name: VBD
 
 # Data Config
-train_data_path: null
-val_data_path: null
+train_data_path: /media/user/volume_0/yuhsiang/VBD/data/waymo/train
+val_data_path: /media/user/volume_0/yuhsiang/VBD/data/waymo/test
 anchor_path: ./vbd/data/cluster_64_center_dict.pkl
 log_dir: ./train_log
 
@@ -17,7 +17,7 @@ init_from: null
 
 # Model Config
 agents_len: 32
-future_len: 80
+future_len: 79  # Must be divisible by action_len (2) for VBD model compatibility 
 action_len: 2
 encoder_layers: 6
 prediction_type: sample
