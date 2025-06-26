@@ -34,7 +34,7 @@ MAX_TRAFFIC_LIGHTS = 16
 CURRENT_INDEX = 10
 NUM_POINTS_POLYLINE = 30
 HISTORY_LENGTH = 11  # 0 to 10
-FUTURE_LENGTH = 79   # 11 to 89 (must satisfy (FUTURE_LENGTH-1) % action_len == 0)
+FUTURE_LENGTH = 79   # From CURRENT_INDEX (inclusive) to end (Waymo-style)
 
 # Agent type mapping
 AGENT_TYPE_MAP = {
@@ -73,59 +73,8 @@ def wrap_to_pi(angle):
     """Wrap an angle to the range [-pi, pi]."""
     return (angle + np.pi) % (2 * np.pi) - np.pi
 
-def apply_ego_centric_transform(coordinates, ego_position, ego_heading):
-    """
-    Transform coordinates from global to ego-centric coordinate system.
-    
-    Args:
-        coordinates: Array of shape (..., 2 or 3) with x, y[, z] coordinates
-        ego_position: Array of shape (2,) with ego x, y position
-        ego_heading: Scalar ego heading angle in radians
-    
-    Returns:
-        Transformed coordinates in ego-centric system (same shape as input)
-    """
-    original_shape = coordinates.shape
-    
-    # Handle both 2D and 3D coordinates
-    if original_shape[-1] == 2:
-        # 2D coordinates (x, y)
-        xy_coords = coordinates
-    elif original_shape[-1] == 3:
-        # 3D coordinates (x, y, z) - only transform x, y
-        xy_coords = coordinates[..., :2]
-    else:
-        raise ValueError(f"Coordinates must have 2 or 3 dimensions, got {original_shape[-1]}")
-    
-    # Translate to ego position
-    translated = xy_coords - ego_position
-    
-    # Rotate to ego heading (ego faces along positive x-axis)
-    cos_theta = np.cos(-ego_heading)  # Negative for coordinate transformation
-    sin_theta = np.sin(-ego_heading)
-    
-    # Apply rotation matrix
-    translated_flat = translated.reshape(-1, 2)
-    
-    rotated = np.zeros_like(translated_flat)
-    rotated[:, 0] = cos_theta * translated_flat[:, 0] - sin_theta * translated_flat[:, 1]
-    rotated[:, 1] = sin_theta * translated_flat[:, 0] + cos_theta * translated_flat[:, 1]
-    
-    # Reshape back to original xy shape
-    rotated = rotated.reshape(xy_coords.shape)
-    
-    # Handle return value based on input dimensions
-    if original_shape[-1] == 2:
-        return rotated
-    else:
-        # For 3D input, preserve z coordinate
-        result = coordinates.copy()
-        result[..., :2] = rotated
-        return result
 
-def transform_heading_to_ego_frame(headings, ego_heading):
-    """Transform headings from global to ego-centric frame."""
-    return wrap_to_pi(headings - ego_heading)
+
 
 def calculate_relations(agents, polylines, traffic_lights):
     """
@@ -250,9 +199,12 @@ def process_agents(tracks_data):
         if not agent_data['state']['valid'][CURRENT_INDEX]:
             continue
             
-        # Agent type
-        agent_type_str = agent_data['type']
-        agents_type[i] = AGENT_TYPE_MAP.get(agent_type_str, 0)
+        # Agent type – fall back to metadata if necessary
+        agent_type_str = agent_data.get('type')
+        if agent_type_str is None and 'metadata' in agent_data:
+            agent_type_str = agent_data['metadata'].get('type')
+        agent_type_str = str(agent_type_str) if agent_type_str is not None else 'UNKNOWN'
+        agents_type[i] = AGENT_TYPE_MAP.get(agent_type_str.upper(), 0)
         
         # Agent interest (assume all are interested for now)
         agents_interested[i] = 10 if i < 16 else 1  # Mark first 16 as highly interested
@@ -269,23 +221,13 @@ def process_agents(tracks_data):
         widths = agent_data['state']['width'][:HISTORY_LENGTH] 
         heights = agent_data['state']['height'][:HISTORY_LENGTH]
         
-        # Apply ego-centric coordinate transformation
-        transformed_positions = apply_ego_centric_transform(positions, sdc_position, sdc_heading)
-        transformed_headings = transform_heading_to_ego_frame(headings, sdc_heading)
-        
-        # Transform velocities to ego frame (rotate velocity vectors - no translation)
-        cos_theta = np.cos(-sdc_heading)
-        sin_theta = np.sin(-sdc_heading)
-        transformed_velocities = np.zeros_like(velocities)
-        transformed_velocities[:, 0] = cos_theta * velocities[:, 0] - sin_theta * velocities[:, 1]
-        transformed_velocities[:, 1] = sin_theta * velocities[:, 0] + cos_theta * velocities[:, 1]
-        
+        # No ego-centric transformation - keep global/world coordinates like Waymo converter
         # Fill history: x, y, yaw, vel_x, vel_y, length, width, height
-        agents_history[i, :, 0] = transformed_positions[:, 0]  # x (ego-centric)
-        agents_history[i, :, 1] = transformed_positions[:, 1]  # y (ego-centric)
-        agents_history[i, :, 2] = transformed_headings  # yaw (ego-centric)
-        agents_history[i, :, 3] = transformed_velocities[:, 0]  # vel_x (ego-centric)
-        agents_history[i, :, 4] = transformed_velocities[:, 1]  # vel_y (ego-centric)
+        agents_history[i, :, 0] = positions[:, 0]  # x (world)
+        agents_history[i, :, 1] = positions[:, 1]  # y (world)
+        agents_history[i, :, 2] = headings  # yaw (world)
+        agents_history[i, :, 3] = velocities[:, 0]  # vel_x (world)
+        agents_history[i, :, 4] = velocities[:, 1]  # vel_y (world)
         agents_history[i, :, 5] = lengths  # length (unchanged)
         agents_history[i, :, 6] = widths   # width (unchanged)
         agents_history[i, :, 7] = heights  # height (unchanged)
@@ -293,8 +235,8 @@ def process_agents(tracks_data):
         # Zero out invalid timesteps
         agents_history[i][~valid_mask] = 0
         
-        # Future data (timesteps CURRENT_INDEX+1 to end)
-        future_start = CURRENT_INDEX + 1
+        # Future data (timesteps CURRENT_INDEX to end, inclusive) to match Waymo converter
+        future_start = CURRENT_INDEX
         future_end = min(future_start + FUTURE_LENGTH, len(agent_data['state']['valid']))
         future_valid_mask = agent_data['state']['valid'][future_start:future_end]
         
@@ -303,31 +245,27 @@ def process_agents(tracks_data):
             future_velocities = agent_data['state']['velocity'][future_start:future_end]
             future_headings = agent_data['state']['heading'][future_start:future_end]
             
-            # Apply ego-centric transformation to future data
-            transformed_future_positions = apply_ego_centric_transform(future_positions, sdc_position, sdc_heading)
-            transformed_future_headings = transform_heading_to_ego_frame(future_headings, sdc_heading)
-            
-            # Transform future velocities (rotate only, no translation)
-            transformed_future_velocities = np.zeros_like(future_velocities)
-            transformed_future_velocities[:, 0] = cos_theta * future_velocities[:, 0] - sin_theta * future_velocities[:, 1]
-            transformed_future_velocities[:, 1] = sin_theta * future_velocities[:, 0] + cos_theta * future_velocities[:, 1]
+            # Keep world coordinates
+            transformed_future_positions = future_positions
+            transformed_future_headings = future_headings
+            transformed_future_velocities = future_velocities
             
             actual_future_length = future_end - future_start
             
             # Fill future: x, y, yaw, vel_x, vel_y
-            agents_future[i, :actual_future_length, 0] = transformed_future_positions[:, 0]  # x (ego-centric)
-            agents_future[i, :actual_future_length, 1] = transformed_future_positions[:, 1]  # y (ego-centric)
-            agents_future[i, :actual_future_length, 2] = transformed_future_headings  # yaw (ego-centric)
-            agents_future[i, :actual_future_length, 3] = transformed_future_velocities[:, 0]  # vel_x (ego-centric)
-            agents_future[i, :actual_future_length, 4] = transformed_future_velocities[:, 1]  # vel_y (ego-centric)
+            agents_future[i, :actual_future_length, 0] = transformed_future_positions[:, 0]  # x (world)
+            agents_future[i, :actual_future_length, 1] = transformed_future_positions[:, 1]  # y (world)
+            agents_future[i, :actual_future_length, 2] = transformed_future_headings  # yaw (world)
+            agents_future[i, :actual_future_length, 3] = transformed_future_velocities[:, 0]  # vel_x (world)
+            agents_future[i, :actual_future_length, 4] = transformed_future_velocities[:, 1]  # vel_y (world)
             
             # Zero out invalid future timesteps
             agents_future[i, :actual_future_length][~future_valid_mask] = 0
     
     return (agents_history, agents_future, agents_interested, agents_type, agents_id, sdc_position, sdc_heading)
 
-def process_map_features(map_features_data, agent_positions, ego_position, ego_heading):
-    """Process map features from ScenarioNet format to VBD format."""
+def process_map_features(map_features_data, agent_positions):
+    """Process map features from ScenarioNet format to VBD format (world coordinates)."""
     
     # Filter and sort map features by relevance to agents
     relevant_features = []
@@ -364,10 +302,10 @@ def process_map_features(map_features_data, agent_positions, ego_position, ego_h
         # Resample polyline to fixed number of points
         resampled_polyline = resample_polyline(polyline, NUM_POINTS_POLYLINE)
         
-        # Apply ego-centric coordinate transformation to polyline
-        transformed_polyline = apply_ego_centric_transform(resampled_polyline[:, :2], ego_position, ego_heading)
+        # Use world coordinates directly
+        transformed_polyline = resampled_polyline[:, :2]
         
-        # Calculate heading from consecutive points (after transformation)
+        # Calculate heading from consecutive points (world coordinates)
         headings = np.zeros(NUM_POINTS_POLYLINE)
         for j in range(NUM_POINTS_POLYLINE - 1):
             dx = transformed_polyline[j+1, 0] - transformed_polyline[j, 0]
@@ -376,9 +314,9 @@ def process_map_features(map_features_data, agent_positions, ego_position, ego_h
         headings[-1] = headings[-2]  # Copy last heading
         
         # Fill polyline: x, y, heading, traffic_light_state, type
-        polylines[i, :, 0] = transformed_polyline[:, 0]  # x (ego-centric)
-        polylines[i, :, 1] = transformed_polyline[:, 1]  # y (ego-centric)
-        polylines[i, :, 2] = headings  # heading (ego-centric)
+        polylines[i, :, 0] = transformed_polyline[:, 0]  # x (world)
+        polylines[i, :, 1] = transformed_polyline[:, 1]  # y (world)
+        polylines[i, :, 2] = headings  # heading (world)
         polylines[i, :, 3] = 0  # traffic_light_state (will be filled later)
         polylines[i, :, 4] = type_code  # type
         
@@ -386,8 +324,8 @@ def process_map_features(map_features_data, agent_positions, ego_position, ego_h
     
     return polylines, polylines_valid
 
-def process_traffic_lights(dynamic_map_states_data, ego_position, ego_heading):
-    """Process traffic light data from ScenarioNet format to VBD format."""
+def process_traffic_lights(dynamic_map_states_data):
+    """Process traffic light data from ScenarioNet format to VBD format in world coordinates."""
     
     traffic_light_data = []
     
@@ -397,10 +335,8 @@ def process_traffic_lights(dynamic_map_states_data, ego_position, ego_heading):
             
         stop_point = light_data['stop_point'][:2]  # x, y only
         
-        # Apply ego-centric coordinate transformation to traffic light position
-        transformed_stop_point = apply_ego_centric_transform(
-            stop_point.reshape(1, 2), ego_position, ego_heading
-        ).flatten()
+        # Use world coordinates directly for traffic light position
+        transformed_stop_point = stop_point
         
         # Get state at current timestep
         states = light_data['state']['object_state']
@@ -429,21 +365,20 @@ def convert_scenarionet_to_vbd(scenarionet_data):
     """Convert a single ScenarioNet pickle file to VBD format."""
     
     try:
-        # Process agents with ego-centric transformation
+
         (agents_history, agents_future, agents_interested, 
          agents_type, agents_id, ego_position, ego_heading) = process_agents(scenarionet_data['tracks'])
         
-        # Get valid agent positions for map filtering (already in ego-centric coordinates)
         valid_agents = agents_interested > 0
         agent_positions = agents_history[valid_agents, -1, :3]  # x, y, heading at current timestep
         
-        # Process map features with ego-centric transformation
+       
         polylines, polylines_valid = process_map_features(
-            scenarionet_data['map_features'], agent_positions, ego_position, ego_heading)
+            scenarionet_data['map_features'], agent_positions)
         
         # Process traffic lights with ego-centric transformation
         traffic_light_points = process_traffic_lights(
-            scenarionet_data['dynamic_map_states'], ego_position, ego_heading)
+            scenarionet_data['dynamic_map_states'])
         
         # Calculate spatial relations
         relations = calculate_relations(agents_history, polylines, traffic_light_points)
@@ -464,13 +399,6 @@ def convert_scenarionet_to_vbd(scenarionet_data):
         
         # Add scenario metadata
         vbd_data['scenario_id'] = scenarionet_data['id']
-        
-        # Add ego transformation metadata for debugging
-        vbd_data['ego_transform'] = {
-            'ego_position': ego_position.astype(np.float32),
-            'ego_heading': float(ego_heading),
-            'transform_applied': True
-        }
         
         return vbd_data
         
