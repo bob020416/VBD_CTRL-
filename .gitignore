@@ -51,3 +51,8 @@ env/
 # OS generated files
 .DS_Store
 Thumbs.db
+# local artifacts
+ckpt/
+data/
+train_log/
+testing_results/

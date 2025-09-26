@@ -172,6 +172,98 @@ class Denoiser(nn.Module):
         self._agents_len = agents_len
         self.decoder.reset_agent_length(agents_len)
 
+# for vbd_ctrl
+class Ctrl_Denoiser(nn.Module):
+    def __init__(
+        self,
+        future_len=80,
+        action_len=5,
+        agents_len=32,
+        steps=100,
+        input_dim=5,
+        decoder_dropout: float = 0.1,
+        attn_dropout: float = 0.1,
+    ):
+        super().__init__()
+        self._agents_len = agents_len
+        self._action_len = action_len
+        self._input_dim = input_dim
+        self.noise_level_embedding = nn.Embedding(steps, 256)
+        # Use the ControlNet version of TransformerDecoder
+        self.decoder = Ctrl_TransformerDecoder(
+            future_len,
+            agents_len,
+            self._action_len,
+            input_dim=self._input_dim,
+            attn_dropout=attn_dropout,
+            decoder_dropout=decoder_dropout,
+        )
+
+    def forward(
+        self,
+        encoder_inputs,
+        noisy_actions,
+        diffusion_step,
+        future_conditioning=None,
+        film_layers=None,
+        control_mask=None,
+        rollout=True,
+    ):
+        '''
+        Args:
+            noisy_actions: [B, A, T_r, 2], [acc, yaw_rate] Unnormalized actions
+            diffusion_step: [B, A]
+            future_conditioning: [B, A, F] - ControlNet conditioning features (optional)
+        Output:
+            denoised_states: [B, A, T, 3], [x, y, theta]
+        '''
+        noisy_actions = noisy_actions[:, :self._agents_len]
+
+        if type(diffusion_step) == int:
+            diffusion_step = torch.full(
+                noisy_actions.shape[:-2], diffusion_step,
+                dtype=torch.long, device=noisy_actions.device
+            )
+        else:
+            diffusion_step = diffusion_step[:, :self._agents_len]
+
+        current_states = encoder_inputs['agents'][:, :self._agents_len, -1]
+
+        encodings = encoder_inputs['encodings']
+        relations = encoder_inputs['relation_encodings']
+
+        agents_mask = encoder_inputs['agents_mask']
+        maps_mask = encoder_inputs['maps_mask']
+        traffic_lights_mask = encoder_inputs['traffic_lights_mask']
+        mask = torch.cat([agents_mask, maps_mask, traffic_lights_mask], dim=-1)
+
+        # denoise step
+        noise_level = self.noise_level_embedding(diffusion_step)
+        if rollout:
+            embedding = roll_out(current_states, noisy_actions,
+                                    action_len=self._action_len, global_frame=False)
+        else:
+            embedding = noisy_actions
+
+        decoder_output = self.decoder(
+            embedding,
+            noise_level,
+            encodings,
+            relations,
+            mask,
+            future_conditioning=future_conditioning,
+            film_layers=film_layers,
+            control_mask=control_mask,
+        )
+
+        return decoder_output
+    
+    def reset_agent_length(self, agents_len):
+        self._agents_len = agents_len
+        self.decoder.reset_agent_length(agents_len)
+
+
+
 
 class AgentEncoder(nn.Module):
     def __init__(self):
@@ -404,6 +496,7 @@ class TransformerEncoder(nn.Module):
         return encodings
 
 
+
 class CrossTransformer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -430,7 +523,6 @@ class CrossTransformer(nn.Module):
         output = self.norm_2(self.ffn(attention_output) + attention_output)
 
         return output
-
 
 class TransformerDecoder(nn.Module):
     def __init__(self, future_len, agents_len, action_len, input_dim=5, ouptut_dim = 2,  causal = True):
@@ -499,6 +591,143 @@ class TransformerDecoder(nn.Module):
 
         query_content_stack = torch.stack(query_content_list, dim=1) # [B, Na, T, 256] 
         query_content_stack = query_content_stack + query
+    
+        query_content_list = []
+        for i in range(self._agents_len):
+            query_content = self.attention_layers[2](
+                query_content_stack[:, i],
+                query_content_stack.reshape(-1, self._agents_len*self._future_len, 256),
+                relations[:, i, :self._agents_len].repeat_interleave(self._future_len, dim=1),
+                attn_mask=self.casual_mask[i]) # [B, T, 256]
+            query_content = self.attention_layers[3](query_content, encodings, relations[:, i], key_mask=mask) # [B, T, 256]
+            query_content_list.append(query_content)
+        
+        query_content_stack = torch.stack(query_content_list, dim=1) # [B, Na, T, 256] 
+        actions = self.decoder(query_content_stack) 
+
+        return actions
+        
+    def reset_agent_length(self, agents_len):
+        self._agents_len = agents_len
+        new_mask = self.generate_casual_mask().type_as(self.casual_mask)
+        self.casual_mask = new_mask\
+
+
+# For vbd_ctrl
+
+class Ctrl_TransformerDecoder(nn.Module):
+    def __init__(
+        self,
+        future_len,
+        agents_len,
+        action_len,
+        input_dim=5,
+        ouptut_dim=2,
+        causal=True,
+        attn_dropout: float = 0.1,
+        decoder_dropout: float = 0.1,
+    ):
+        super().__init__()
+        self._future_len = future_len
+        self._action_len = action_len
+        self._agents_len = agents_len
+        self._future_len = future_len // action_len
+        self._input_dim = input_dim
+        self._output_dim = ouptut_dim
+
+        self.time_embedding = nn.Embedding(self._future_len, 256)
+        # We reuse the base CrossTransformer which has a fixed internal dropout rate (0.1)
+        # attn_dropout is kept for API symmetry but not directly applied here.
+        self.attention_layers = nn.ModuleList([CrossTransformer() for _ in range(4)])
+        self.encoder = nn.Sequential(nn.Linear(self._input_dim, 128), nn.ReLU(), nn.Linear(128, 256))
+        self.decoder = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ELU(),
+            nn.Dropout(decoder_dropout),
+            nn.Linear(128, self._output_dim),
+        )
+
+        self.register_buffer('casual_mask', self.generate_casual_mask(causal))
+        self.register_buffer('time', torch.arange(self._future_len).unsqueeze(0))
+
+    def generate_casual_mask(self, causal=True):
+        if not causal:
+            return torch.zeros(self._agents_len, self._future_len, self._agents_len * self._future_len, dtype=bool)
+
+        # Initialize a zero mask
+        mask = torch.zeros(self._agents_len, self._future_len, self._agents_len * self._future_len)
+
+        # An agent can attend to all of its own actions
+        for i in range(self._agents_len):
+            mask[i, :, i*self._future_len:(i+1)*self._future_len] = 1.0
+
+        # An agent can attend to other agents from all previous timesteps but not future timesteps
+        for i in range(self._agents_len):
+            for j in range(self._agents_len):
+                if i != j:
+                    for t in range(self._future_len):
+                        mask[i, t, j*self._future_len:j*self._future_len+t+1] = 1.0
+
+        # Convert to boolean mask
+        mask = mask.bool().logical_not()
+
+        return mask
+
+    def forward(
+        self,
+        noisy_trajectories,
+        noise_level,
+        encodings,
+        relations,
+        mask,
+        future_conditioning=None,
+        film_layers=None,
+        control_mask=None,
+    ):
+        '''
+        noisy_trajectories: [B, Na, T_f, 5]
+        future_conditioning: [B, A, F] - ControlNet conditioning features (optional)
+        '''
+        # get query
+        noisy_trajectories = torch.reshape(noisy_trajectories, (-1, self._agents_len,
+                                                                self._future_len, self._action_len, self._input_dim))
+        future_states = self.encoder(noisy_trajectories)
+        future_states = future_states.max(dim=3).values # [B, Na, T, 256]
+        time_embedding = self.time_embedding(self.time) # [1, T, 256]
+        query = future_states + time_embedding[:, None] # [B, Na, T, 256]
+        query = query + noise_level[:, :, None, :]
+
+        # Apply FiLM conditioning at Block 0 (after noise level addition)
+        if future_conditioning is not None and film_layers is not None:
+            film_layer = film_layers.get('block_0', None)
+            if film_layer is not None:
+                conditioning = future_conditioning
+                if control_mask is not None:
+                    conditioning = conditioning * control_mask[:, :, None]
+                query = film_layer(query, conditioning)
+
+        # decode denoised actions - First attention block
+        query_content_list = []
+        for i in range(self._agents_len):
+            query_content = self.attention_layers[0](
+                query[:, i],
+                query.reshape(-1, self._agents_len*self._future_len, 256),
+                relations[:, i, :self._agents_len].repeat_interleave(self._future_len, dim=1),
+                attn_mask=self.casual_mask[i]) # [B, T, 256]
+            query_content = self.attention_layers[1](query_content, encodings, relations[:, i], key_mask=mask) # [B, T, 256]
+            query_content_list.append(query_content)
+
+        query_content_stack = torch.stack(query_content_list, dim=1) # [B, Na, T, 256]
+        query_content_stack = query_content_stack + query
+
+        # Apply FiLM conditioning at Block 1 (after first attention block)
+        if future_conditioning is not None and film_layers is not None:
+            film_layer = film_layers.get('block_1', None)
+            if film_layer is not None:
+                conditioning = future_conditioning
+                if control_mask is not None:
+                    conditioning = conditioning * control_mask[:, :, None]
+                query_content_stack = film_layer(query_content_stack, conditioning)
     
         query_content_list = []
         for i in range(self._agents_len):
