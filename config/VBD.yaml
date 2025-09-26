@@ -17,7 +17,7 @@ init_from: null
 
 # Model Config
 agents_len: 32
-future_len: 80
+future_len: 79  # Must be divisible by action_len (2) for VBD model compatibility 
 action_len: 2
 encoder_layers: 6
 prediction_type: sample
